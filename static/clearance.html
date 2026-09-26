@@ -1,0 +1,67 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>术前放行协调台</title>
+<style>
+body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}
+section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001;margin-bottom:16px}
+input,select,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px;cursor:pointer}
+button.ghost{background:#475569}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #e2e8f0;padding:8px;text-align:left;font-size:14px}
+.tag{padding:2px 8px;border-radius:10px;font-size:12px;color:white}.approved{background:#15803d}.rejected{background:#b91c1c}.pending{background:#a16207}.pending_backfill{background:#7c3aed}
+.card{border:1px solid #e2e8f0;border-radius:8px;padding:12px;margin-top:10px}.msg{color:#b91c1c;font-size:13px}a{color:#be123c}
+</style>
+<h1>术前放行协调台</h1>
+<p><a href="/">← 返回总览</a>。接收医院提交交叉配型结果与主刀可手术时段；系统按器官剩余时间判断是否放行。未通过的分配停在待接收，协调台可补录，旧分配无记录显示“待补录”。</p>
+<section>
+  身份 <input id="u" value="hospital-h2" style="width:140px">
+  角色 <select id="r" onchange="load()"><option value="hospital">hospital</option><option value="coordinator">coordinator</option><option value="allocation_officer">allocation_officer</option><option value="auditor">auditor</option></select>
+  机构 <input id="h" value="H2" style="width:80px">
+  <button onclick="load()">刷新</button>
+</section>
+<section><h3>分配列表</h3><div id="list"></div></section>
+<section id="detail" style="display:none"><h3 id="detailTitle"></h3><div id="detailBody"></div></section>
+<script>
+function headers(extra){return Object.assign({'X-User-Id':u.value,'X-Role':r.value,'X-Hospital':h.value,'Content-Type':'application/json'},extra||{})}
+function tag(s){let m={approved:['已放行','approved'],rejected:['未通过','rejected'],pending:['待提交','pending'],pending_backfill:['待补录','pending_backfill']};let [t,c]=m[s]||[s,'pending'];return `<span class="tag ${c}">${t}</span>`}
+async function api(path,opt){let r=await fetch(path,Object.assign({headers:headers()},opt||{}));return {status:r.status,body:await r.json()}}
+async function load(){
+  let {body}=await api('/api/state');
+  let rows=(body.allocations||[]).map(a=>`<tr>
+    <td>#${a.id}</td><td>${a.status}</td><td>${tag(a.clearance_status||'')}</td>
+    <td><button class="ghost" onclick="openClearance(${a.id})">放行记录/操作</button></td></tr>`).join('');
+  list.innerHTML=`<table><tr><th>分配</th><th>状态</th><th>术前放行</th><th></th></tr>${rows||'<tr><td>暂无</td></tr>'}</table>`;
+}
+async function openClearance(id){
+  detail.style.display='block';detailTitle.textContent=`分配 #${id} 术前放行`;detailBody.innerHTML='加载中…';
+  let {status,body}=await api(`/api/allocations/${id}/clearance`);
+  if(status!==200){detailBody.innerHTML=`<p class="msg">${body.message||'无法查看'}</p>`;return}
+  let s=body.summary;
+  let reasons=(s.reason_messages||[]).map(m=>`<li>${m}</li>`).join('');
+  let records=body.records.map(rec=>`<div class="card">
+    <b>#${rec.id} ${rec.decision==='approved'?'✅ 放行':'⛔ 未通过'}</b>${rec.backfilled?' <span class="tag pending_backfill">补录</span>':''}
+    <br>提交人：${rec.submitted_by}（${rec.submitter_role}），时刻：${rec.submitted_at}
+    <br>交叉配型：${rec.crossmatch_compatible===null?'<i>缺项</i>':(rec.crossmatch_compatible?'合格':'不合格')}
+    ；主刀时段：${rec.surgeon_available_at||'<i>缺项</i>'}
+    ${rec.remaining_minutes!==null?`；距过期剩余 ${rec.remaining_minutes} 分钟`:''}
+    ${rec.reason_messages&&rec.reason_messages.length?`<ul>${rec.reason_messages.map(x=>`<li class="msg">${x}</li>`).join('')}</ul>`:''}
+  </div>`).join('')||'<p>尚无放行记录。</p>';
+  let form='';
+  if(r.value==='hospital'||r.value==='coordinator'){
+    let backfill=r.value==='coordinator';
+    form=`<div class="card"><b>${backfill?'协调台补录':'接收医院提交'}</b>
+      <p><label>交叉配型结果 <select id="cm"><option value="">未提交（缺项）</option><option value="true">合格</option><option value="false">不合格</option></select></label></p>
+      <p><label>主刀最早可手术时刻 <input id="slot" type="datetime-local"></label></p>
+      ${backfill?'<p><label>补录提交时刻（留空为当前） <input id="at" type="datetime-local"></label></p>':''}
+      <button onclick="submitClearance(${id},${backfill})">${backfill?'补录放行记录':'提交术前放行'}</button> <span id="formMsg"></span></p></div>`;
+  }
+  detailBody.innerHTML=`<p>${tag(s.status)} ${s.status_label||''}</p>${reasons?`<ul>${reasons}</ul>`:''}${form}<h4>历史记录</h4>${records}`;
+}
+async function submitClearance(id,backfill){
+  let payload={};
+  if(cm.value)payload.crossmatch_compatible=cm.value==='true';else payload.crossmatch_compatible=null;
+  if(slot.value)payload.surgeon_available_at=new Date(slot.value).toISOString();
+  if(backfill&&at.value)payload.submitted_at=new Date(at.value).toISOString();
+  let path=`/api/allocations/${id}/clearance${backfill?'-backfill':''}`;
+  let {status,body}=await api(path,{method:'POST',body:JSON.stringify(payload)});
+  if(status===201){formMsg.textContent='已记录：'+body.clearance.decision;openClearance(id);load()}
+  else formMsg.innerHTML=`<span class="msg">${body.message}</span>`;
+}
+load();
+</script>

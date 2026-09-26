@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import clearance as clearance_policy
+from clearance import ClearanceSubmission
+from clearance_records import ClearanceStore
+
 PORT = 8203
 ROLES = {"viewer", "hospital", "coordinator", "allocation_officer", "auditor"}
 STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired"}
@@ -74,6 +78,7 @@ class Repository:
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        ClearanceStore(self.conn)
 
     @contextmanager
     def tx(self):
@@ -187,7 +192,20 @@ class OrganAllocationService:
         if role == "hospital" and hospital != row["candidate_hospital"]:
             result["patient_name"] = "***"
         result["handoff"] = self._row(conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone())
+        result["clearance"] = self._clearance_view(conn, row["status"], allocation_id)
         return result
+
+    @staticmethod
+    def _clearance_view(conn: sqlite3.Connection, allocation_status: str, allocation_id: int) -> dict[str, Any]:
+        record = ClearanceStore.latest_for(conn, allocation_id)
+        status = clearance_policy.summarize(allocation_status, record)
+        view: dict[str, Any] = {"status": status, "status_label": clearance_policy.STATUS_LABELS[status]}
+        if record is not None:
+            rendered = ClearanceStore.render(record)
+            view["latest"] = rendered
+            view["reasons"] = rendered["reasons"]
+            view["reason_messages"] = [clearance_policy.reason_label(code) for code in rendered["reasons"]]
+        return view
 
     def _ensure_active(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
@@ -212,9 +230,69 @@ class OrganAllocationService:
             if row["status"] == "accepted": return self._allocation(conn, allocation_id, role, hospital)
             if row["status"] != "proposed": raise ApiError(409, "invalid_transition", "当前状态不能接受")
             if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配信息已发生变化")
+            clearance = ClearanceStore.latest_for(conn, allocation_id)
+            if clearance is None:
+                raise ApiError(409, "preop_clearance_missing", "术前放行尚未提交，不能接受")
+            if clearance["decision"] != clearance_policy.STATUS_APPROVED:
+                messages = [clearance_policy.reason_label(code) for code in json.loads(clearance["reasons_json"])]
+                raise ApiError(409, "preop_clearance_not_approved", f"术前放行未通过：{'；'.join(messages)}")
             conn.execute("UPDATE allocations SET status='accepted',accepted_at=?,revision=revision+1,updated_at=? WHERE id=?", (iso(), iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_accepted", {"hospital": hospital})
             return self._allocation(conn, allocation_id, role, hospital)
+
+    def _record_clearance(self, conn: sqlite3.Connection, row: sqlite3.Row, actor: str, role: str,
+                          body: dict[str, Any], backfilled: bool) -> dict[str, Any]:
+        if "crossmatch_compatible" in body and body["crossmatch_compatible"] is not None and not isinstance(body["crossmatch_compatible"], bool):
+            raise ApiError(400, "invalid_crossmatch", "crossmatch_compatible 必须为布尔值")
+        crossmatch = body.get("crossmatch_compatible")
+        slot_raw = body.get("surgeon_available_at")
+        if slot_raw is not None and not str(slot_raw).strip(): slot_raw = None
+        if slot_raw is not None and not isinstance(slot_raw, str): raise ApiError(400, "invalid_slot", "surgeon_available_at 必须为 ISO 8601 时间")
+        slot = parse_time(slot_raw) if slot_raw else None
+        submitted = parse_time(body["submitted_at"]) if body.get("submitted_at") else utcnow()
+        donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+        evaluation = clearance_policy.evaluate(ClearanceSubmission(
+            allocation_created_at=parse_time(row["created_at"]), expires_at=parse_time(donor["expires_at"]),
+            submitted_at=submitted, crossmatch_compatible=crossmatch, surgeon_available_at=slot))
+        record_id = ClearanceStore.add(
+            conn, row["id"], actor, role, crossmatch, iso(slot) if slot else None,
+            evaluation, backfilled, iso(submitted), iso(evaluation["review_deadline"]))
+        stored = ClearanceStore.render(dict(conn.execute("SELECT * FROM clearance_records WHERE id=?", (record_id,)).fetchone()))
+        stored["review_deadline"] = iso(evaluation["review_deadline"])
+        stored["remaining_minutes"] = evaluation["remaining_minutes"]
+        stored["limits"] = evaluation["limits"]
+        stored["reason_messages"] = [clearance_policy.reason_label(code) for code in stored["reasons"]]
+        Repository.audit(conn, row["id"], row["donor_id"], actor, role,
+                         "clearance_backfilled" if backfilled else "clearance_submitted",
+                         {"decision": evaluation["decision"], "reasons": evaluation["reasons"], "backfilled": backfilled})
+        return stored
+
+    def submit_clearance(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "hospital": raise ApiError(403, "clearance_forbidden", "只有接收医院可以提交术前放行")
+        with self.repo.tx() as conn:
+            row = self._ensure_active(conn, allocation_id, actor, role)
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+            if candidate["hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由候选患者所在医院提交术前放行")
+            if row["status"] != "proposed": raise ApiError(409, "invalid_transition", "分配已离开待接收状态，提交请走协调台补录")
+            record = self._record_clearance(conn, row, actor, role, body, backfilled=False)
+            return {"clearance": record, "allocation": self._allocation(conn, allocation_id, role, hospital)}
+
+    def backfill_clearance(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "coordinator": raise ApiError(403, "backfill_forbidden", "只有协调台可以补录术前放行")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
+            if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
+            record = self._record_clearance(conn, row, actor, role, body, backfilled=True)
+            return {"clearance": record, "allocation": self._allocation(conn, allocation_id, role, "")}
+
+    def list_clearance(self, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
+        if role == "viewer": raise ApiError(403, "clearance_forbidden", "当前角色不能查看放行记录")
+        with self.repo.tx() as conn:
+            allocation = self._allocation(conn, allocation_id, role, hospital)
+            records = [ClearanceStore.render(r) for r in ClearanceStore.list_for(conn, allocation_id)]
+            for record in records:
+                record["reason_messages"] = [clearance_policy.reason_label(code) for code in record["reasons"]]
+            return {"allocation_id": allocation_id, "summary": allocation["clearance"], "records": records}
 
     def mark_transit(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "allocation_officer": raise ApiError(403, "transit_forbidden", "只有分配员可以登记转运")
@@ -319,6 +397,13 @@ class OrganAllocationService:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates ORDER BY id DESC")]
             allocated = [dict(r) for r in conn.execute("SELECT * FROM allocations ORDER BY id DESC")]
+        if role != "viewer":
+            latest = ClearanceStore.latest_map(conn)
+            for item in allocated:
+                record = latest.get(item["id"])
+                status = clearance_policy.summarize(item["status"], record)
+                item["clearance_status"] = status
+                item["clearance_status_label"] = clearance_policy.STATUS_LABELS[status]
         return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
 
 
@@ -344,6 +429,8 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.audit(int(parts[2]), role)}
+        if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "clearance":
+            return 200, self.service.list_clearance(int(parts[2]), role, hospital)
         raise ApiError(404, "not_found", "接口不存在")
     def dispatch_post(self, path: str) -> tuple[int, Any]:
         actor, role, hospital = self.service.identity(self.headers); body = self.read_body(); parts = [p for p in path.split("/") if p]
@@ -363,14 +450,17 @@ class Handler(BaseHTTPRequestHandler):
                 "handoff": lambda: self.service.initiate_handoff(aid, actor, role, hospital, body),
                 "handoff-accept": lambda: self.service.accept_handoff(aid, actor, role, hospital, body),
                 "implant": lambda: self.service.implant(aid, actor, role, body),
+                "clearance": lambda: self.service.submit_clearance(aid, actor, role, hospital, body),
+                "clearance-backfill": lambda: self.service.backfill_clearance(aid, actor, role, body),
             }
-            if action in routes: return 200, routes[action]()
+            if action in routes: return (201 if action in {"clearance", "clearance-backfill"} else 200), routes[action]()
         raise ApiError(404, "not_found", "接口不存在")
     def handle_any(self, method: str) -> None:
         parsed = urlparse(self.path)
         try:
-            if method == "GET" and parsed.path == "/":
-                raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            if method == "GET" and parsed.path in {"/", "/clearance"}:
+                page = "index.html" if parsed.path == "/" else "clearance.html"
+                raw = (self.web_root / page).read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             status, payload = self.dispatch_get(parsed.path) if method == "GET" else self.dispatch_post(parsed.path)
             json_reply(self, status, payload)
         except ApiError as exc: json_reply(self, exc.status, {"error": exc.code, "message": exc.message})
