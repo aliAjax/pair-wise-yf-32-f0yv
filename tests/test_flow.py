@@ -22,6 +22,8 @@ class OrganFlowTest(unittest.TestCase):
         rank = self.svc.ranking(donor["id"], "allocation_officer", "")
         self.assertEqual(rank["candidates"][0]["id"], candidate["id"])
         allocation = self.svc.propose("allocator", "allocation_officer", {"donor_id": donor["id"], "candidate_id": candidate["id"]})
+        release = self.svc.submit_release(allocation["id"], "hospital-h2", "hospital", "H2", {"crossmatch_result": "pass", "window_start": iso(self.now + timedelta(hours=2)), "window_end": iso(self.now + timedelta(hours=6))})
+        self.assertEqual(release["release"]["decision"], "cleared")
         accepted = self.svc.accept(allocation["id"], "hospital-h2", "hospital", "H2", {"expected_revision": 1})
         self.assertEqual(accepted["status"], "accepted")
         transit = self.svc.mark_transit(allocation["id"], "allocator", "allocation_officer", {"cold_chain_temp": 3.5})
@@ -33,7 +35,7 @@ class OrganFlowTest(unittest.TestCase):
         implanted = self.svc.implant(allocation["id"], "allocator", "allocation_officer", {})
         self.assertEqual(implanted["status"], "implanted")
         audit = self.svc.audit(allocation["id"], "auditor")
-        self.assertEqual([item["action"] for item in audit], ["allocation_proposed", "allocation_accepted", "transfer_started", "handoff_initiated", "handoff_accepted", "organ_implanted"])
+        self.assertEqual([item["action"] for item in audit], ["allocation_proposed", "release_submitted", "allocation_accepted", "transfer_started", "handoff_initiated", "handoff_accepted", "organ_implanted"])
 
     def test_expiry_privacy_and_single_allocation(self):
         expired = self.donor(expires_days=-1); candidate = self.candidate()

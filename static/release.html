@@ -1,0 +1,32 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>术前放行 - 器官分配协调台</title>
+<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001;margin-bottom:16px}pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}input,select,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px}.tag{display:inline-block;padding:2px 10px;border-radius:10px;color:#fff}.pending{background:#b45309}.cleared{background:#15803d}.blocked{background:#b91c1c}</style>
+<h1>术前放行</h1>
+<p>接收医院在此提交交叉配型结果和主刀可手术时段，系统按器官剩余时间判断是否放行；不合格、复核超时或时段不足时分配保持待接收。协调台（coordinator 角色）可用本页补录和查看记录。<a href="/">返回协调台</a></p>
+<section>
+  <input id="u" value="hospital-h2" placeholder="X-User-Id"><input id="r" value="hospital" placeholder="X-Role"><input id="h" value="H2" placeholder="X-Hospital">
+  <input id="aid" type="number" min="1" placeholder="分配 ID"><button onclick="load()">查看记录</button>
+</section>
+<section>
+  <h3>提交 / 补录放行</h3>
+  <select id="cm"><option value="pass">交叉配型合格</option><option value="fail">交叉配型不合格</option></select>
+  <label>主刀可手术时段</label>
+  <input id="ws" type="datetime-local"> ~ <input id="we" type="datetime-local">
+  <button onclick="submit()">提交放行</button>
+</section>
+<section><h3>放行状态</h3><div id="st"></div><pre id="o"></pre></section>
+<script>
+const LABEL={pending:"待补",cleared:"已放行",blocked:"未通过"};
+function hdr(){let h={"Content-Type":"application/json","X-User-Id":u.value,"X-Role":r.value};if(document.getElementById("h").value)h["X-Hospital"]=document.getElementById("h").value;return h}
+function showStatus(s){st.innerHTML=s?`<span class="tag ${s}">${LABEL[s]||s}</span>`:""}
+async function load(){
+  let res=await fetch(`/api/allocations/${aid.value}/release`,{headers:hdr()});
+  let data=await res.json();showStatus(data.release_status);o.textContent=JSON.stringify(data,null,2);
+}
+async function submit(){
+  let body={crossmatch_result:cm.value,window_start:ws.value||null,window_end:we.value||null};
+  let res=await fetch(`/api/allocations/${aid.value}/release`,{method:"POST",headers:hdr(),body:JSON.stringify(body)});
+  let data=await res.json();
+  showStatus(data.allocation?data.allocation.release_status:data.release_status);
+  o.textContent=JSON.stringify(data,null,2);
+}
+</script>

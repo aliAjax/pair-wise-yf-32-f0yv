@@ -13,14 +13,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import release_store
+from release_rules import evaluate_release
+
 PORT = 8203
 ROLES = {"viewer", "hospital", "coordinator", "allocation_officer", "auditor"}
 STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired"}
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message); self.status, self.code, self.message = status, code, message
+    def __init__(self, status: int, code: str, message: str, detail: dict[str, Any] | None = None):
+        super().__init__(message); self.status, self.code, self.message = status, code, message; self.detail = detail or {}
 
 
 def utcnow() -> datetime: return datetime.now(timezone.utc)
@@ -90,7 +93,9 @@ class Repository:
 
 
 class OrganAllocationService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path):
+        self.repo = Repository(path)
+        release_store.ensure_schema(self.repo.conn)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -187,6 +192,9 @@ class OrganAllocationService:
         if role == "hospital" and hospital != row["candidate_hospital"]:
             result["patient_name"] = "***"
         result["handoff"] = self._row(conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone())
+        latest_release = release_store.ReleaseStore(conn).latest(allocation_id)
+        result["release"] = latest_release
+        result["release_status"] = "pending" if latest_release is None else latest_release["decision"]
         return result
 
     def _ensure_active(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str) -> sqlite3.Row:
@@ -201,6 +209,53 @@ class OrganAllocationService:
             raise ApiError(409, "organ_expired", "器官已经超过可用时间，禁止继续流转")
         return row
 
+    @staticmethod
+    def _ensure_release_cleared(conn: sqlite3.Connection, allocation: sqlite3.Row) -> None:
+        """接受前的术前放行闸口：缺记录、结果不合格、复核超时或时段不足都保持待接收。"""
+        latest = release_store.ReleaseStore(conn).latest(allocation["id"])
+        if not latest:
+            raise ApiError(409, "release_missing", "缺少术前放行记录，分配保持待接收",
+                           {"missing": [{"code": "release_missing", "message": "尚未提交交叉配型结果和主刀可手术时段"}]})
+        donor = conn.execute("SELECT * FROM donors WHERE id=?", (allocation["donor_id"],)).fetchone()
+        decision, missing = evaluate_release(
+            crossmatch_result=latest["crossmatch_result"],
+            window_start=parse_time(latest["window_start"]) if latest["window_start"] else None,
+            window_end=parse_time(latest["window_end"]) if latest["window_end"] else None,
+            submitted_at=parse_time(latest["submitted_at"]),
+            organ_expires_at=parse_time(donor["expires_at"]), now=utcnow())
+        if decision != "cleared":
+            raise ApiError(409, "release_blocked", "术前放行未通过，分配保持待接收", {"missing": missing, "release_id": latest["id"]})
+
+    def submit_release(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"hospital", "coordinator"}: raise ApiError(403, "release_forbidden", "只有接收医院或协调台可以提交术前放行")
+        raw_result = body.get("crossmatch_result")
+        crossmatch = str(raw_result).strip().lower() if raw_result not in (None, "") else None
+        window_start = parse_time(body["window_start"]) if body.get("window_start") else None
+        window_end = parse_time(body["window_end"]) if body.get("window_end") else None
+        with self.repo.tx() as conn:
+            row = self._ensure_active(conn, allocation_id, actor, role)
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+            if role == "hospital" and candidate["hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由候选患者所在医院提交术前放行")
+            donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+            now = utcnow()
+            decision, missing = evaluate_release(crossmatch_result=crossmatch, window_start=window_start, window_end=window_end,
+                                                 submitted_at=now, organ_expires_at=parse_time(donor["expires_at"]), now=now)
+            source = "coordinator_backfill" if role == "coordinator" else "hospital"
+            record = release_store.ReleaseStore(conn).record(
+                allocation_id=allocation_id, crossmatch_result=crossmatch,
+                window_start=iso(window_start) if window_start else None, window_end=iso(window_end) if window_end else None,
+                decision=decision, missing=missing, submitted_by=actor, source=source, submitted_at=iso(now))
+            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "release_submitted",
+                             {"decision": decision, "missing": [m["code"] for m in missing], "source": source})
+            return {"release": record, "allocation": self._allocation(conn, allocation_id, role, hospital)}
+
+    def get_release(self, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
+        if role == "viewer": raise ApiError(403, "release_forbidden", "当前角色不能查看术前放行")
+        conn = self.repo.conn
+        allocation = self._allocation(conn, allocation_id, role, hospital)
+        return {"allocation_id": allocation_id, "release_status": allocation["release_status"],
+                "release": allocation["release"], "history": release_store.ReleaseStore(conn).history(allocation_id)}
+
     def accept(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "hospital": raise ApiError(403, "hospital_required", "只有接收医院可以接受器官")
         expected = body.get("expected_revision")
@@ -211,6 +266,7 @@ class OrganAllocationService:
             if candidate["hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由候选患者所在医院接受")
             if row["status"] == "accepted": return self._allocation(conn, allocation_id, role, hospital)
             if row["status"] != "proposed": raise ApiError(409, "invalid_transition", "当前状态不能接受")
+            self._ensure_release_cleared(conn, row)
             if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配信息已发生变化")
             conn.execute("UPDATE allocations SET status='accepted',accepted_at=?,revision=revision+1,updated_at=? WHERE id=?", (iso(), iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_accepted", {"hospital": hospital})
@@ -319,6 +375,11 @@ class OrganAllocationService:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates ORDER BY id DESC")]
             allocated = [dict(r) for r in conn.execute("SELECT * FROM allocations ORDER BY id DESC")]
+        if role != "viewer":
+            store = release_store.ReleaseStore(conn)
+            for item in allocated:
+                latest = store.latest(item["id"])
+                item["release_status"] = "pending" if latest is None else latest["decision"]
         return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
 
 
@@ -343,6 +404,7 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in path.split("/") if p]
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
+        if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "release": return 200, self.service.get_release(int(parts[2]), role, hospital)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.audit(int(parts[2]), role)}
         raise ApiError(404, "not_found", "接口不存在")
     def dispatch_post(self, path: str) -> tuple[int, Any]:
@@ -362,6 +424,7 @@ class Handler(BaseHTTPRequestHandler):
                 "delay": lambda: self.service.report_delay(aid, actor, role, body),
                 "handoff": lambda: self.service.initiate_handoff(aid, actor, role, hospital, body),
                 "handoff-accept": lambda: self.service.accept_handoff(aid, actor, role, hospital, body),
+                "release": lambda: self.service.submit_release(aid, actor, role, hospital, body),
                 "implant": lambda: self.service.implant(aid, actor, role, body),
             }
             if action in routes: return 200, routes[action]()
@@ -369,11 +432,15 @@ class Handler(BaseHTTPRequestHandler):
     def handle_any(self, method: str) -> None:
         parsed = urlparse(self.path)
         try:
-            if method == "GET" and parsed.path == "/":
-                raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            pages = {"/": "index.html", "/release.html": "release.html"}
+            if method == "GET" and parsed.path in pages:
+                raw = (self.web_root / pages[parsed.path]).read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             status, payload = self.dispatch_get(parsed.path) if method == "GET" else self.dispatch_post(parsed.path)
             json_reply(self, status, payload)
-        except ApiError as exc: json_reply(self, exc.status, {"error": exc.code, "message": exc.message})
+        except ApiError as exc:
+            payload = {"error": exc.code, "message": exc.message}
+            if exc.detail: payload["detail"] = exc.detail
+            json_reply(self, exc.status, payload)
         except Exception as exc: print(f"unhandled error: {exc!r}"); json_reply(self, 500, {"error": "internal_error", "message": str(exc)})
     def do_GET(self) -> None: self.handle_any("GET")
     def do_POST(self) -> None: self.handle_any("POST")
